@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Minimal OpenWrt uci mock (get/set/delete/add_list/commit/show) - state kept in $UCI_DIR/<config>.json"""
+import json, os, re, sys
+D = os.environ["UCI_DIR"]
+args = [a for a in sys.argv[1:] if a not in ("-q",)]
+quiet = "-q" in sys.argv[1:]
+
+def load(cfg):
+    p = os.path.join(D, cfg + ".json")
+    if os.path.exists(p):
+        return json.load(open(p))
+    src = os.path.join(os.environ.get("UCI_SRC", "/nonexistent"), cfg)
+    secs = []
+    if os.path.exists(src):
+        cur = None
+        for line in open(src):
+            m = re.match(r"\s*config\s+(\S+)(?:\s+'?([^']*)'?)?\s*$", line)
+            if m:
+                cur = {"_type": m.group(1), "_name": m.group(2) or None}
+                secs.append(cur); continue
+            m = re.match(r"\s*option\s+(\S+)\s+'?([^']*)'?\s*$", line)
+            if m and cur is not None:
+                cur[m.group(1)] = m.group(2)
+    return secs
+
+def save(cfg, secs):
+    json.dump(secs, open(os.path.join(D, cfg + ".json"), "w"))
+
+def find(secs, sref):
+    m = re.match(r"@(\w+)\[(-?\d+)\]$", sref)
+    if m:
+        lst = [s for s in secs if s["_type"] == m.group(1)]
+        i = int(m.group(2))
+        try: return lst[i]
+        except IndexError: return None
+    for s in secs:
+        if s["_name"] == sref: return s
+    return None
+
+def fail():
+    if not quiet: print("uci: Entry not found", file=sys.stderr)
+    sys.exit(1)
+
+cmd = args[0]
+if cmd == "commit": sys.exit(0)
+if cmd == "show":
+    cfg = args[1].split(".")[0]
+    for s in load(cfg):
+        n = s["_name"] or "anon"
+        print(f"{cfg}.{n}={s['_type']}")
+        for k, v in s.items():
+            if not k.startswith("_"):
+                print(f"{cfg}.{n}.{k}={v if isinstance(v,str) else ' '.join(v)}")
+    sys.exit(0)
+ref = args[1]
+val = None
+if "=" in ref and cmd in ("set", "add_list"):
+    ref, val = ref.split("=", 1)
+parts = ref.split(".")
+cfg = parts[0]
+secs = load(cfg)
+if cmd == "get":
+    if len(parts) < 2: fail()
+    s = find(secs, parts[1])
+    if s is None: fail()
+    if len(parts) == 2: print(s["_type"]); sys.exit(0)
+    if parts[2] not in s: fail()
+    v = s[parts[2]]
+    print(v if isinstance(v, str) else " ".join(v)); sys.exit(0)
+if cmd == "set":
+    s = find(secs, parts[1])
+    if len(parts) == 2:
+        if s is None: secs.append({"_type": val, "_name": parts[1]})
+        else: s["_type"] = val
+    else:
+        if s is None: fail()
+        s[parts[2]] = val
+    save(cfg, secs); sys.exit(0)
+if cmd == "add_list":
+    s = find(secs, parts[1])
+    if s is None: fail()
+    cur = s.get(parts[2], [])
+    if isinstance(cur, str): cur = [cur]
+    s[parts[2]] = cur + [val]
+    save(cfg, secs); sys.exit(0)
+if cmd == "delete":
+    s = find(secs, parts[1])
+    if s is None: fail()
+    if len(parts) == 2: secs.remove(s)
+    else:
+        if parts[2] not in s: fail()
+        del s[parts[2]]
+    save(cfg, secs); sys.exit(0)
+print("unsupported", args, file=sys.stderr); sys.exit(2)

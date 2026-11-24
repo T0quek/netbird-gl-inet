@@ -1,0 +1,4 @@
+#!/bin/sh
+# mock pidof: processes are alive unless $FIX_DIR/dnsmasq_dead exists
+[ -f "${FIX_DIR:-/tmp}/dnsmasq_dead" ] && exit 1
+exit 0

@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Mock NetBird client - state kept in $NBM_DIR/state.json"""
+import json, os, sys
+D = os.environ["NBM_DIR"]; P = os.path.join(D, "state.json")
+st = json.load(open(P)) if os.path.exists(P) else {}
+st.setdefault("version", "0.80.0"); st.setdefault("daemonStatus", "NeedsLogin")
+st.setdefault("networks", []); st.setdefault("calls", [])
+args = sys.argv[1:]
+while args and args[0].startswith("--daemon-addr"):
+    args = args[2:] if args[0] == "--daemon-addr" else args[1:]
+st["calls"].append(args)
+def save(): json.dump(st, open(P, "w"))
+def sock(): return os.path.exists(os.environ.get("NB_SOCK", "/nonexistent"))
+c = args[0] if args else ""
+if c == "version":
+    print(st["version"]); save(); sys.exit(0)
+if c == "up" and "--help" in args:
+    print("Flags:\n  --management-url string\n  --setup-key-file string\n  --disable-client-routes\n  --disable-server-routes\n  --disable-dns\n  --allow-server-ssh\n  --block-inbound\n  --dns-resolver-address string\n")
+    save(); sys.exit(0)
+if c == "selftest":
+    save(); sys.exit(0)
+if not sock():
+    print("daemon not running", file=sys.stderr); save(); sys.exit(1)
+if c == "status":
+    if "--json" in args:
+        print(json.dumps({"daemonStatus": st["daemonStatus"], "netbirdIp": "100.90.1.2/16" if st["daemonStatus"]=="Connected" else "",
+            "fqdn": "beryl7.netbird.cloud", "management": {"url": "https://api.netbird.io:443", "connected": st["daemonStatus"]=="Connected", "error": ""},
+            "peers": {"total": 1, "connected": 1, "details": [{"fqdn": "<img src=x onerror=alert(1)>.netbird.cloud", "netbirdIp": "100.90.0.1", "status": "Connected", "connectionType": "P2P", "latency": 12000000}]},
+            "dnsServers": st.get("dnsServers", [{"servers": ["10.10.10.10:53"], "domains": ["local", "Home.LAN."], "enabled": True, "error": ""},
+                                                {"servers": ["1.1.1.1:53"], "domains": [], "enabled": True, "error": ""}]),
+            "daemonVersion": st["version"], "cliVersion": st["version"]}))
+    else:
+        print("Management: %s" % ("Connected" if st["daemonStatus"]=="Connected" else "Disconnected"))
+    save(); sys.exit(0)
+if c == "up":
+    if "--setup-key-file" in args:
+        k = open(args[args.index("--setup-key-file")+1]).read().strip()
+        if k != "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE":
+            st["daemonStatus"] = "LoginFailed"; save(); sys.exit(1)
+        st["enrolled"] = True
+    if not st.get("enrolled"):
+        save(); sys.exit(1)
+    if st.get("up_fails"):
+        save(); sys.exit(1)
+    st["daemonStatus"] = "Connected"; st["up_args"] = args; save(); sys.exit(0)
+if c == "down":
+    if st.get("enrolled"): st["daemonStatus"] = "Idle"
+    save(); sys.exit(0)
+if c == "networks":
+    sub = args[1]
+    if sub == "list":
+        if not st["networks"]: print("No networks available.")
+        else:
+            print("Available Networks:")
+            for n in st["networks"]:
+                print("\n  - ID: %s\n    Network: %s\n    Status: %s" % (n["id"], n["net"], "Selected" if n["sel"] else "Not Selected"))
+    else:
+        ids = [x for x in args[2:] if not x.startswith("-")]
+        for n in st["networks"]:
+            if n["id"] in ids: n["sel"] = (sub == "select")
+        print("Networks %sed successfully." % sub)
+    save(); sys.exit(0)
+save(); sys.exit(0)

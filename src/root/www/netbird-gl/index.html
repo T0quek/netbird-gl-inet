@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>NetBird</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="loading" class="page"><div class="tips is-default">Loading…</div></div>
+
+<!-- ================================================= setup wizard -->
+<div id="wizard" class="page" hidden>
+  <div class="view-title"><span>NetBird</span><span class="pill is-warn">Setup</span></div>
+  <section class="card wizard-card">
+    <div class="card-h"><div class="card-t">Connect this router to NetBird</div>
+      <button id="wiz-cancel" class="link" type="button" hidden>Cancel</button></div>
+    <div class="card-b">
+      <ol class="stepper" id="stepper">
+        <li data-s="1"><span>1</span>Server</li>
+        <li data-s="2"><span>2</span>Setup key</li>
+        <li data-s="3"><span>3</span>Options</li>
+        <li data-s="4"><span>4</span>Connect</li>
+      </ol>
+
+      <div id="wiz-prep" class="step" hidden>
+        <div class="tips is-info"><span class="spinner"></span><div>Downloading NetBird for this router. This takes a minute – the setup continues automatically.</div></div>
+      </div>
+
+      <div class="step" data-step="1" hidden>
+        <h3>Where is your NetBird management server?</h3>
+        <div class="choice" role="radiogroup">
+          <button type="button" class="choice-item" data-type="cloud" role="radio">
+            <b>NetBird Cloud</b><small>app.netbird.io – hosted by NetBird</small></button>
+          <button type="button" class="choice-item" data-type="self" role="radio">
+            <b>Self-hosted</b><small>your own NetBird server</small></button>
+        </div>
+        <ul class="rows" id="wiz-url-row" hidden>
+          <li><div class="k">Management URL</div>
+            <div class="v wide"><input id="wiz-url" class="inp" type="url" autocomplete="off" spellcheck="false" placeholder="https://netbird.example.com:443"></div></li>
+        </ul>
+        <p class="hint" id="wiz-url-hint" hidden>Use the address of your NetBird server including the port, e.g. https://netbird.example.com:443.</p>
+      </div>
+
+      <div class="step" data-step="2" hidden>
+        <h3>Paste a setup key</h3>
+        <ul class="rows">
+          <li><div class="k">Setup key</div>
+            <div class="v wide"><input id="wiz-key" class="inp mono" type="password" autocomplete="off" spellcheck="false" placeholder="XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"></div></li>
+        </ul>
+        <div class="tips is-info"><div>In the NetBird dashboard open <b>Setup Keys → Create Setup Key</b>. Assign a group such as <i>routers</i> so you can share exit nodes and routes with it. The key is used once and never stored on the router.</div></div>
+      </div>
+
+      <div class="step" data-step="3" hidden>
+        <h3>Options</h3>
+        <ul class="rows">
+          <li><div class="k">Accept routes from other peers<small>reach networks behind other peers, e.g. your home LAN – required for exit nodes</small></div>
+            <div class="v"><button type="button" class="sw" id="wiz-accept_routes" role="switch"></button></div></li>
+          <li><div class="k">Use NetBird DNS<small>devices on this router resolve peer names and your NetBird nameserver domains</small></div>
+            <div class="v"><button type="button" class="sw" id="wiz-use_dns" role="switch"></button></div></li>
+          <li><div class="k">Allow the guest network to use NetBird</div>
+            <div class="v"><button type="button" class="sw" id="wiz-guest_access" role="switch"></button></div></li>
+          <li><div class="k">Toggle button</div>
+            <div class="v"><select id="wiz-switch" class="inp">
+              <option value="keep">Leave unchanged</option>
+              <option value="NetBird-VPN">NetBird connection on/off</option>
+              <option value="NetBird-Exit-Node">Exit node on/off</option>
+            </select></div></li>
+        </ul>
+      </div>
+
+      <div class="step" data-step="4" hidden>
+        <h3>Ready to connect</h3>
+        <ul class="rows" id="wiz-summary">
+          <li><div class="k">Server</div><div class="v" id="sum-server"></div></li>
+          <li><div class="k">Setup key</div><div class="v mono" id="sum-key"></div></li>
+          <li><div class="k">Options</div><div class="v" id="sum-opts"></div></li>
+        </ul>
+        <div id="wiz-result" class="tips" hidden></div>
+      </div>
+
+      <div class="btns">
+        <button type="button" class="btn" id="wiz-back">Back</button>
+        <button type="button" class="btn primary" id="wiz-next">Next</button>
+      </div>
+    </div>
+  </section>
+</div>
+
+<!-- ================================================= dashboard -->
+<div id="dash" class="page" hidden>
+  <div class="view-title"><span>NetBird</span><span id="title-pill" class="pill">…</span></div>
+  <div id="banner" class="tips is-warning banner" hidden><span id="banner-text"></span>
+    <button type="button" class="btn small primary" data-act="update_now">Update now</button></div>
+
+  <div class="grid">
+    <div class="col">
+      <section class="card">
+        <div class="card-h"><div class="card-t"><i class="dot" id="conn-dot"></i>Connection</div>
+          <button type="button" class="sw medium" id="sw-vpn" role="switch" aria-label="NetBird connection"></button></div>
+        <div class="card-b">
+          <ul class="rows">
+            <li><div class="k">Status</div><div class="v" id="v-status">—</div></li>
+            <li id="ks-row" hidden><div class="k">Kill switch</div><div class="v warn">Internet blocked – needs NetBird and the exit node</div></li>
+            <li><div class="k">NetBird IP</div><div class="v mono" id="v-ip">—</div></li>
+            <li><div class="k">Hostname</div><div class="v mono" id="v-fqdn">—</div></li>
+            <li><div class="k">Management server</div><div class="v" id="v-mgmt">—</div></li>
+            <li><div class="k">Peers online</div><div class="v" id="v-peers">—</div></li>
+            <li><div class="k">NetBird DNS<small>domains answered through NetBird for all devices on this router</small></div><div class="v" id="v-dns">—</div></li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-h"><div class="card-t">Advanced</div></div>
+        <div class="card-b">
+          <ul class="rows">
+            <li><div class="k">Accept routes from other peers<small>networks behind other peers (e.g. your home LAN) – required for exit nodes</small></div>
+              <div class="v"><button type="button" class="sw" id="s-accept_routes" role="switch"></button></div></li>
+            <li><div class="k">Use NetBird DNS<small>resolve NetBird peer names and your NetBird nameserver domains</small></div>
+              <div class="v"><button type="button" class="sw" id="s-use_dns" role="switch"></button></div></li>
+            <li><div class="k">Extra NetBird DNS domains<small>e.g. local → truenas.local</small></div>
+              <div class="v"><input type="text" class="inp sm" id="s-dns_extra" maxlength="300" spellcheck="false" autocomplete="off" placeholder="local"></div></li>
+            <li><div class="k">Kill switch<small>internet only through the NetBird exit node – blocked whenever NetBird or the exit node is off</small></div>
+              <div class="v"><button type="button" class="sw" id="s-kill_switch" role="switch"></button></div></li>
+            <li><div class="k">Guest network may use NetBird</div>
+              <div class="v"><button type="button" class="sw" id="s-guest_access" role="switch"></button></div></li>
+            <li><div class="k">Allow peers to reach the router<small>admin panel, SSH – not recommended</small></div>
+              <div class="v"><button type="button" class="sw" id="s-allow_inbound" role="switch"></button></div></li>
+          </ul>
+          <div class="btns">
+            <button type="button" class="btn" data-act="restart">Restart daemon</button>
+            <button type="button" class="btn" id="btn-reenroll">Re-enroll…</button>
+            <button type="button" class="btn" id="btn-logout" hidden>Log out</button>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div class="col">
+      <section class="card">
+        <div class="card-h"><div class="card-t"><i class="dot" id="exit-dot"></i>Exit node</div>
+          <button type="button" class="sw medium" id="sw-exit" role="switch" aria-label="Exit node"></button></div>
+        <div class="card-b">
+          <ul class="rows">
+            <li><div class="k">Route internet traffic through</div>
+              <div class="v"><select id="s-exit_node" class="inp"><option value="">Select an exit node…</option></select></div></li>
+            <li><div class="k">Status</div><div class="v" id="v-exit">—</div></li>
+          </ul>
+          <p class="hint" id="exit-hint">Exit nodes appear here once a peer is configured as an exit node for this router's group in the NetBird dashboard (Networks → Exit node).</p>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-h"><div class="card-t">Toggle button</div></div>
+        <div class="card-b">
+          <ul class="rows">
+            <li><div class="k">Function</div>
+              <div class="v"><select id="s-switch_func" class="inp">
+                <option value="none">No function</option>
+                <option value="NetBird-VPN">NetBird connection on/off</option>
+                <option value="NetBird-Exit-Node">Exit node on/off</option>
+              </select></div></li>
+            <li><div class="k">Invert direction</div>
+              <div class="v"><button type="button" class="sw" id="s-switch_invert" role="switch"></button></div></li>
+          </ul>
+          <p class="hint">Same setting as SYSTEM → Toggle Button Settings.</p>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-h"><div class="card-t">NetBird updates</div><span id="upd-pill" class="pill"></span></div>
+        <div class="card-b">
+          <ul class="rows">
+            <li><div class="k">Installed version</div><div class="v" id="u-cur">—</div></li>
+            <li><div class="k">Latest version</div><div class="v" id="u-lat">—</div></li>
+            <li><div class="k">Automatic install</div><div class="v" id="u-auto">—</div></li>
+            <li><div class="k">Check daily for updates</div>
+              <div class="v"><button type="button" class="sw" id="s-auto_check" role="switch"></button></div></li>
+            <li><div class="k">Install automatically<small>if not updated manually</small></div>
+              <div class="v"><button type="button" class="sw" id="s-auto_update" role="switch"></button></div></li>
+            <li><div class="k">Install after</div>
+              <div class="v"><select id="s-update_delay_days" class="inp">
+                <option value="0">Immediately</option><option value="1">1 day</option><option value="3">3 days</option><option value="7">7 days</option>
+                <option value="14">14 days</option><option value="30">30 days</option>
+              </select></div></li>
+          </ul>
+          <div class="btns">
+            <button type="button" class="btn" data-act="update_check">Check now</button>
+            <button type="button" class="btn primary" data-act="update_now" id="btn-update">Update now</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <section class="card wide">
+    <div class="card-h"><div class="card-t">Peers</div><span id="peers-pill" class="pill"></span></div>
+    <div class="card-b">
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Peer</th><th>NetBird IP</th><th>Status</th><th>Connection</th><th>Latency</th></tr></thead>
+          <tbody id="peers"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="card wide">
+    <details>
+      <summary class="card-h"><div class="card-t">Log</div><span class="hint">click to expand</span></summary>
+      <div class="card-b"><pre id="log"></pre></div>
+    </details>
+  </section>
+  <div class="foot">netbird-gl <span id="v-app"></span></div>
+</div>
+
+<!-- ================================================= login -->
+<div id="login" class="page" hidden>
+  <section class="card login-card">
+    <div class="card-h"><div class="card-t">NetBird</div></div>
+    <div class="card-b">
+      <p id="login-text" class="hint"></p>
+      <form id="login-form" hidden>
+        <ul class="rows"><li><div class="k">Password</div>
+          <div class="v"><input id="l-pw" class="inp" type="password" autocomplete="current-password"></div></li></ul>
+        <div class="btns"><button class="btn primary" type="submit">Log in</button></div>
+      </form>
+      <div class="btns"><a id="login-gl" class="btn primary" href="/" target="_top" hidden>Go to the login page</a></div>
+    </div>
+  </section>
+</div>
+
+<div id="toast" class="toast" role="status" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>

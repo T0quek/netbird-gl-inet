@@ -1,0 +1,10 @@
+#!/bin/sh
+# mock /etc/init.d/netbird: socket only when the binary passes its selftest
+mk() { "$NB_BIN" selftest >/dev/null 2>&1 && python3 -c "import socket,sys;s=socket.socket(socket.AF_UNIX);s.bind(sys.argv[1])" "$NB_SOCK"; }
+case "$1" in
+	start) [ -S "$NB_SOCK" ] || mk ;;
+	stop) rm -f "$NB_SOCK" ;;
+	restart) rm -f "$NB_SOCK"; mk ;;
+esac
+echo "$1" >> "${FIX_DIR:-/tmp}/init.log"
+exit 0

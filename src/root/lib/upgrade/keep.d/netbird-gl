@@ -1,0 +1,16 @@
+/etc/netbird/
+/etc/init.d/netbird
+/etc/init.d/netbird-gl
+/etc/rc.d/S95netbird
+/etc/rc.d/K10netbird
+/etc/rc.d/S96netbird-gl
+/etc/rc.d/K09netbird-gl
+/usr/sbin/netbird-gl
+/usr/lib/netbird-gl/
+/etc/gl-switch.d/NetBird-VPN.sh
+/etc/gl-switch.d/NetBird-Exit-Node.sh
+/etc/nginx/gl-conf.d/netbird-gl.conf
+/www/netbird-gl/
+/www/views/gl-sdk4-ui-netbirdgl.common.js.gz
+/usr/share/oui/menu.d/netbird-gl.json
+/lib/upgrade/keep.d/netbird-gl

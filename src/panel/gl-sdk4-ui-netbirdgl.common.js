@@ -1,0 +1,1 @@
+module.exports=(function(){return{name:"GlNetbirdGl",render:function(h){return h("div",{style:"margin:0;padding:0"},[h("iframe",{attrs:{src:"/netbird-gl/",frameborder:"0",title:"NetBird"},style:"width:100%;height:calc(100vh - 64px);border:none;display:block"})])}}})()

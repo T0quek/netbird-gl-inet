@@ -1,0 +1,883 @@
+#!/bin/sh
+# netbird-gl - NetBird control for GL.iNet routers (Beryl 7 / GL-MT3600BE)
+# Usage: netbird-gl <command> [arguments]   (netbird-gl help)
+
+: "${NBGL_LIB:=/usr/lib/netbird-gl}"
+# shellcheck source=../lib/netbird-gl/common.sh
+. "$NBGL_LIB/common.sh"
+
+# ============================================================ firewall ====
+fw_reload() {
+	[ -x /etc/init.d/firewall ] && /etc/init.d/firewall reload >/dev/null 2>&1
+	return 0
+}
+fw_setup() {
+	for _s in nbgl_zone nbgl_lan nbgl_guest nbgl_include; do uci -q delete "firewall.$_s"; done
+	uci set firewall.nbgl_zone=zone
+	uci set firewall.nbgl_zone.name=netbird
+	uci add_list firewall.nbgl_zone.device=wt0
+	if [ "$(cfg_def main.allow_inbound 0)" = 1 ]; then
+		uci set firewall.nbgl_zone.input=ACCEPT
+	else
+		uci set firewall.nbgl_zone.input=REJECT
+	fi
+	uci set firewall.nbgl_zone.output=ACCEPT
+	uci set firewall.nbgl_zone.forward=REJECT
+	uci set firewall.nbgl_zone.masq=1
+	uci set firewall.nbgl_zone.mtu_fix=1
+	uci set firewall.nbgl_lan=forwarding
+	uci set firewall.nbgl_lan.src=lan
+	uci set firewall.nbgl_lan.dest=netbird
+	if [ "$(cfg_def main.guest_access 0)" = 1 ]; then
+		uci set firewall.nbgl_guest=forwarding
+		uci set firewall.nbgl_guest.src=guest
+		uci set firewall.nbgl_guest.dest=netbird
+	fi
+	uci set firewall.nbgl_include=include
+	uci set firewall.nbgl_include.type=script
+	uci set firewall.nbgl_include.path="$NBGL_LIB/fw-reload.sh"
+	uci set firewall.nbgl_include.reload=1
+	uci commit firewall
+	fw_reload
+}
+fw_remove() {
+	for _s in nbgl_zone nbgl_lan nbgl_guest nbgl_include; do uci -q delete "firewall.$_s"; done
+	uci commit firewall
+	fw_reload
+}
+nb_chains_present() {
+	if command -v iptables-save >/dev/null 2>&1 && iptables-save 2>/dev/null | grep -q NETBIRD; then return 0; fi
+	if command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -qi netbird; then return 0; fi
+	command -v iptables-save >/dev/null 2>&1 || command -v nft >/dev/null 2>&1 || return 0
+	return 1
+}
+
+# ============================================================ exit node ===
+# $1 = 1/0 ; returns 0 ok, 2 selected exit node not offered, 3 VPN not running
+exit_apply() {
+	_want=$(cfg_get main.exit_node)
+	nb_running || return 3
+	_found=0
+	_rc=0
+	_list=$(nb_networks)
+	while IFS='	' read -r _id _net _sel; do
+		[ -n "$_id" ] || continue
+		is_exit_net "$_net" || continue
+		if [ "$1" = 1 ] && [ "$_id" = "$_want" ]; then
+			_found=1
+			[ "$_sel" = 1 ] || nbt 15 networks select -a "$_id" </dev/null >/dev/null 2>&1 || _rc=1
+		elif [ "$_sel" = 1 ]; then
+			nbt 15 networks deselect "$_id" </dev/null >/dev/null 2>&1 || _rc=1
+		fi
+	done <<EOF
+$_list
+EOF
+	if [ "$1" = 1 ] && [ "$_found" = 0 ]; then return 2; fi
+	return $_rc
+}
+
+# ============================================================ state =======
+state_vpn() { cfg_def state.vpn 1; }
+state_exit() { cfg_def state.exit 0; }
+
+set_vpn() { # $1 1/0
+	cfg_set state.vpn "$1"
+	cfg_commit
+	reconcile force
+}
+set_exit() { # $1 1/0
+	if [ "$1" = 1 ]; then
+		[ -n "$(cfg_get main.exit_node)" ] || { echo "no exit node selected" >&2; return 2; }
+		# exit nodes are routes (0.0.0.0/0) - they need accept_routes
+		[ "$(cfg_def main.accept_routes 1)" = 1 ] || { echo "accept_routes is off" >&2; return 3; }
+		cfg_set state.vpn 1
+	fi
+	cfg_set state.exit "$1"
+	cfg_commit
+	reconcile force
+}
+
+# Drives the actual state towards the desired one.  $1=force skips throttling
+reconcile() {
+	if [ "${1:-}" = force ]; then
+		_w=0
+		until lock_take reconcile; do
+			[ $_w -ge 30 ] && return 0
+			sleep 1; _w=$((_w + 1))
+		done
+	else
+		lock_take reconcile || return 0
+	fi
+	resolv_guard
+	_st=$(nb_daemon_status)
+	_ts=$(now)
+	_last=$(cat "$NBGL_RUN/last_up" 2>/dev/null || echo 0)
+	if [ "$(state_vpn)" = 1 ]; then
+		case "$_st" in
+			Idle)
+				# Idle = enrolled but disconnected (NeedsLogin waits for enrollment)
+				if [ "${1:-}" = force ] || [ $((_ts - _last)) -ge 120 ]; then
+					echo "$_ts" >"$NBGL_RUN/last_up"
+					nb_up && log "connected (was: $_st)"
+				fi
+				;;
+			Stopped)
+				[ -x "$NB_INIT" ] && nb_present && "$NB_INIT" start >/dev/null 2>&1
+				;;
+		esac
+		_st=$(nb_daemon_status)
+		if [ "$_st" = Connected ]; then
+			dns_listener_fix
+			exit_apply "$(state_exit)"
+			[ $? -eq 2 ] && log "selected exit node is not available"
+		fi
+	else
+		case "$_st" in
+			Connected | Connecting) nb_down && log "disconnected" ;;
+		esac
+	fi
+	dns_sync
+	guard_sync
+	lock_drop reconcile
+}
+
+# ============================================================ kill switch + LED
+ks_tools() { for _t in iptables ip6tables; do command -v "$_t" >/dev/null 2>&1 && echo "$_t"; done; }
+ks_active() { _t=$(ks_tools | head -n1); [ -n "$_t" ] && "$_t" -w -C FORWARD -j NBGL_KILL 2>/dev/null; }
+# LAN/guest devices may only send traffic into the NetBird tunnel (wt0).
+# The router itself is not restricted, so NetBird can always reconnect.
+killswitch_on() {
+	_new=0
+	for _t in $(ks_tools); do
+		"$_t" -w -C FORWARD -j NBGL_KILL 2>/dev/null && continue
+		"$_t" -w -N NBGL_KILL 2>/dev/null
+		"$_t" -w -F NBGL_KILL
+		"$_t" -w -A NBGL_KILL -o wt0 -j RETURN
+		"$_t" -w -A NBGL_KILL -i br-+ -j REJECT
+		"$_t" -w -I FORWARD 1 -j NBGL_KILL
+		_new=1
+	done
+	[ $_new = 1 ] && log "kill switch on: LAN devices may only use the NetBird tunnel"
+	return 0
+}
+killswitch_off() {
+	_was=0
+	for _t in $(ks_tools); do
+		while "$_t" -w -D FORWARD -j NBGL_KILL 2>/dev/null; do _was=1; done
+		"$_t" -w -F NBGL_KILL 2>/dev/null
+		"$_t" -w -X NBGL_KILL 2>/dev/null
+	done
+	[ $_was = 1 ] && log "kill switch off"
+	return 0
+}
+# Kill switch: while enabled, LAN/guest devices may only use the NetBird
+# tunnel - internet works only with NetBird connected and an exit node on.
+guard_sync() {
+	if [ "$(cfg_def main.kill_switch 0)" = 1 ]; then killswitch_on; else killswitch_off; fi
+}
+# 0 when the kill switch currently blocks internet access
+ks_blocking() {
+	ks_active || return 1
+	[ "$(state_vpn)" = 1 ] && [ "$(state_exit)" = 1 ] && [ "$(nb_daemon_status)" = Connected ] && return 1
+	return 0
+}
+
+# ============================================================ toggle switch
+# Called by /etc/gl-switch.d/NetBird-VPN.sh and NetBird-Exit-Node.sh
+switch_action() { # $1 vpn|exit, $2 on|off
+	case "$2" in on) _v=1 ;; off) _v=0 ;; *) return 1 ;; esac
+	[ "$(cfg_def main.switch_invert 0)" = 1 ] && _v=$((1 - _v))
+	case "$1" in
+		vpn) log "toggle switch: VPN=$_v"; set_vpn "$_v" ;;
+		exit) log "toggle switch: exit node=$_v"; set_exit "$_v" ;;
+		*) return 1 ;;
+	esac
+}
+switch_func() { uci -q get "$NBGL_SWITCH_CFG.@main[0].func" 2>/dev/null; }
+# assign the GL toggle button ("none" = GL's "No Function", i.e. no func option)
+switch_set_func() {
+	uci -q get "$NBGL_SWITCH_CFG.@main[0]" >/dev/null 2>&1 || return 0
+	[ "$(switch_func)" = "$1" ] && return 0
+	if [ "$1" = none ]; then
+		uci -q delete "$NBGL_SWITCH_CFG.@main[0].func"
+	else
+		uci -q set "$NBGL_SWITCH_CFG.@main[0].func=$1"
+	fi
+	uci -q commit "$NBGL_SWITCH_CFG"
+	log "toggle button function set to $1"
+}
+
+# ============================================================ updates =====
+upd_latest() { # prints the latest NetBird version (without "v")
+	_f="$NBGL_RUN/latest.json"
+	_v=""
+	if http_get "$NBGL_GH_API" "$_f" 30 2>/dev/null; then
+		_v=$(jsonfilter -i "$_f" -e '@.tag_name' 2>/dev/null)
+	fi
+	if [ -z "$_v" ]; then
+		_v=$(http_location "$NBGL_GH_LATEST" 2>/dev/null)
+		_v=${_v##*/}
+	fi
+	rm -f "$_f"
+	_v=${_v#v}
+	valid_version "$_v" || return 1
+	echo "$_v"
+}
+
+upd_check() { # records the latest version; $1=force ignores the 24 h limit
+	_ts=$(now)
+	_lc=$(cat "$NBGL_RUN/last_check" 2>/dev/null || echo 0)
+	if [ "${1:-}" != force ] && [ $((_ts - _lc)) -lt 86400 ]; then return 0; fi
+	echo "$_ts" >"$NBGL_RUN/last_check"
+	_lat=$(upd_latest) || { echo "check_failed" >"$NBGL_RUN/upd_error"; return 1; }
+	rm -f "$NBGL_RUN/upd_error"
+	if [ "$(cfg_get update.latest)" != "$_lat" ]; then
+		cfg_set update.latest "$_lat"
+		cfg_set update.first_seen "$_ts"
+		cfg_commit
+	fi
+	return 0
+}
+
+# epoch of the automatic installation, or empty
+upd_auto_at() {
+	_lat=$(cfg_get update.latest)
+	_cur=$(nb_version)
+	[ -n "$_lat" ] || return 0
+	[ -n "$_cur" ] && ! version_gt "$_lat" "$_cur" && return 0
+	[ "$(cfg_def main.auto_update 1)" = 1 ] || return 0
+	_fs=$(cfg_def update.first_seen 0)
+	_d=$(cfg_def main.update_delay_days 7)
+	echo $((_fs + _d * 86400))
+}
+
+upd_cycle() { # $1=force
+	[ "$(cfg_def main.auto_check 1)" = 1 ] || return 0
+	upd_check "${1:-}" || return 0
+	_at=$(upd_auto_at)
+	[ -n "$_at" ] || return 0
+	if [ "$(now)" -ge "$_at" ]; then
+		log "automatic NetBird update to $(cfg_get update.latest)"
+		upd_install "$(cfg_get update.latest)"
+	fi
+}
+
+# Install/update the NetBird binary with SHA256 verification and rollback
+upd_install() { # $1 version or "latest"
+	lock_take update || { echo busy; return 4; }
+	echo running >"$NBGL_RUN/job"
+	_rc=0
+	upd_install_inner "$1" || _rc=$?
+	if [ $_rc -eq 0 ]; then rm -f "$NBGL_RUN/upd_error"; else echo "install_failed_$_rc" >"$NBGL_RUN/upd_error"; fi
+	rm -f "$NBGL_RUN/job"
+	lock_drop update
+	return $_rc
+}
+upd_install_inner() {
+	_v=$1
+	[ "$_v" = latest ] && { _v=$(upd_latest) || return 10; }
+	valid_version "$_v" || return 11
+	_a=$(arch_name) || return 12
+	_cur=$(nb_version)
+	if [ -n "$_cur" ] && [ "$_cur" = "$_v" ]; then return 0; fi
+	_tmp_free=$(df -k "$NBGL_TMP" 2>/dev/null | awk 'NR==2{print $4}')
+	[ "${_tmp_free:-0}" -ge 81920 ] || return 13
+	_w=$(mktemp -d "$NBGL_TMP/nbgl-upd.XXXXXX") || return 14
+	_tar="netbird_${_v}_linux_${_a}.tar.gz"
+	_sum="netbird_${_v}_checksums.txt"
+	if ! http_get "$NBGL_GH_DL/v$_v/$_sum" "$_w/$_sum" 60 ||
+		! http_get "$NBGL_GH_DL/v$_v/$_tar" "$_w/$_tar" 600; then
+		rm -rf "$_w"; return 15
+	fi
+	_exp=$(awk -v f="$_tar" '$2==f || $2=="*"f {print $1; exit}' "$_w/$_sum")
+	_got=$(sha256sum "$_w/$_tar" | awk '{print $1}')
+	if ! valid_sha256 "$_exp" || [ "$_exp" != "$_got" ]; then
+		log "ERROR: SHA256 mismatch for $_tar"
+		rm -rf "$_w"; return 16
+	fi
+	if ! tar -xzf "$_w/$_tar" -C "$_w" netbird 2>/dev/null; then rm -rf "$_w"; return 17; fi
+	chmod 755 "$_w/netbird"
+	_nv=$("$_w/netbird" version 2>/dev/null | head -n1 | tr -cd '0-9.')
+	[ "$_nv" = "$_v" ] || { rm -rf "$_w"; return 18; }
+	_dir=$(dirname "$NB_BIN")
+	_need=$(($(wc -c <"$_w/netbird") / 1024 + 1024))
+	_ovl=$(df -k "$_dir" 2>/dev/null | awk 'NR==2{print $4}')
+	_old=0
+	[ -f "$NB_BIN" ] && _old=$(($(wc -c <"$NB_BIN") / 1024))
+	[ $((${_ovl:-0} + _old)) -ge "$_need" ] || { rm -rf "$_w"; return 19; }
+	[ -f "$NB_BIN" ] && cp -p "$NB_BIN" "$_w/netbird.old"
+	[ -x "$NB_INIT" ] && "$NB_INIT" stop >/dev/null 2>&1
+	rm -f "$NB_BIN"
+	if ! cp "$_w/netbird" "$NB_BIN.new" || ! mv -f "$NB_BIN.new" "$NB_BIN"; then
+		rm -f "$NB_BIN.new"
+		[ -f "$_w/netbird.old" ] && cp -p "$_w/netbird.old" "$NB_BIN"
+		[ -x "$NB_INIT" ] && "$NB_INIT" start >/dev/null 2>&1
+		rm -rf "$_w"; return 20
+	fi
+	chmod 755 "$NB_BIN"
+	rm -f "$NBGL_RUN/upflags"
+	[ -x "$NB_INIT" ] && "$NB_INIT" start >/dev/null 2>&1
+	_i=0
+	while ! nb_running && [ $_i -lt 30 ]; do sleep 1; _i=$((_i + 1)); done
+	if ! nb_running || ! nbt 10 status >/dev/null 2>&1; then
+		log "NetBird $_v failed to start - rolling back"
+		[ -x "$NB_INIT" ] && "$NB_INIT" stop >/dev/null 2>&1
+		if [ -f "$_w/netbird.old" ]; then cp -p "$_w/netbird.old" "$NB_BIN"; fi
+		rm -f "$NBGL_RUN/upflags"
+		[ -x "$NB_INIT" ] && "$NB_INIT" start >/dev/null 2>&1
+		rm -rf "$_w"; return 21
+	fi
+	rm -rf "$_w"
+	cfg_set update.installed "$_v"
+	cfg_set update.installed_at "$(now)"
+	cfg_commit
+	log "installed NetBird $_v"
+	return 0
+}
+
+# ============================================================ GL session ==
+rpc_post() {
+	if command -v curl >/dev/null 2>&1; then
+		curl -s --max-time 5 -H 'Content-Type: application/json' --data-binary "$1" "$(gl_rpc_url)"
+	else
+		uclient-fetch -q -T 5 -O - --post-data="$1" "$(gl_rpc_url)" 2>/dev/null
+	fi
+}
+# 0 when the GL /rpc endpoint accepts this session id
+rpc_sid_ok() {
+	_m=$(cfg_def main.auth_rpc "system get_status")
+	_obj=${_m%% *}
+	_fn=${_m#* }
+	re_ok '^[A-Za-z0-9_-]{1,40}$' "$_obj" && re_ok '^[A-Za-z0-9_-]{1,40}$' "$_fn" || return 1
+	valid_alnum "$1" 1 128 || return 1
+	_r=$(rpc_post "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"call\",\"params\":[\"$1\",\"$_obj\",\"$_fn\",{}]}")
+	case "$_r" in
+		*'"error"'*)
+			case "$_r" in
+				*'Access denied'* | *'-32000'*) ;;
+				*) log "GL /rpc error for '$_m' (set netbird_gl.main.auth_rpc to another method): $(printf '%s' "$_r" | head -c 120)" ;;
+			esac
+			return 1
+			;;
+		*'"result"'*) return 0 ;;
+	esac
+	return 1
+}
+# Negative control: a random session id MUST be rejected, otherwise the
+# GL endpoint cannot be used for authentication (fail closed).  Cached 10 min.
+rpc_trustworthy() {
+	_f="$NBGL_RUN/rpc_selftest"
+	if [ -f "$_f" ]; then
+		read -r _t _res <"$_f"
+		[ $(($(now) - ${_t:-0})) -lt 600 ] && [ "$_res" = ok ] && return 0
+		[ $(($(now) - ${_t:-0})) -lt 600 ] && return 1
+	fi
+	_probe=$(rand_hex 16)
+	[ ${#_probe} -eq 32 ] || { log "cannot generate random data"; return 1; }
+	if rpc_sid_ok "$_probe"; then
+		echo "$(now) bad" >"$_f"
+		log "GL /rpc accepts unknown sessions - GL session auth disabled (use auth=password)"
+		return 1
+	fi
+	echo "$(now) ok" >"$_f"
+	return 0
+}
+
+# ============================================================ DNS ==========
+# dnsmasq forwards NetBird domains to NetBird's resolver via a conf-dir drop-in.
+dnsmasq_confdirs() {
+	_d=$(sed -n 's/^conf-dir=\([^,]*\).*/\1/p' /var/etc/dnsmasq.conf* 2>/dev/null | sort -u)
+	[ -n "${NBGL_DNSMASQ_DIR:-}" ] && _d=$NBGL_DNSMASQ_DIR
+	echo "${_d:-/tmp/dnsmasq.d}"
+}
+dns_domains() { # domains NetBird resolves (one per line)
+	_j=$(nb_status_json) || return 0
+	{
+		_f=$(printf '%s' "$_j" | jsonfilter -e '@.fqdn' 2>/dev/null)
+		[ -n "$_f" ] && echo "${_f#*.}"
+		printf '%s' "$_j" | jsonfilter -e '@.dnsServers[*].domains[*]' 2>/dev/null
+	} | tr '[:upper:]' '[:lower:]' | sed 's/\.$//' | sort -u | while IFS= read -r _dom; do
+		valid_domain "$_dom" && echo "$_dom"
+	done
+}
+# 0 when NetBird's resolver listens on $NBGL_DNS_ADDR (unknown -> assume yes)
+dns_listener_ok() {
+	command -v netstat >/dev/null 2>&1 || return 0
+	netstat -lnu 2>/dev/null | grep -q " $NBGL_DNS_ADDR "
+}
+# NetBird applies --dns-resolver-address only on "up": an installation that was
+# already connected keeps its old listener until it reconnects once.
+dns_listener_fix() {
+	[ "$(cfg_def main.use_dns 1)" = 1 ] || return 0
+	nb_has_flag dns-resolver-address || return 0
+	dns_listener_ok && return 0
+	_lf=$(cat "$NBGL_RUN/dns_fix" 2>/dev/null || echo 0)
+	[ $(($(now) - _lf)) -ge 600 ] || return 0
+	now >"$NBGL_RUN/dns_fix"
+	log "NetBird DNS resolver is not on $NBGL_DNS_ADDR - reconnecting to apply it"
+	nb_down
+	nb_up
+}
+# 0 when NetBird pushes a "primary" nameserver group (enabled, no match domains)
+dns_has_primary() {
+	_j=$(nb_status_json) || return 1
+	printf '%s' "$_j" | jsonfilter -e '@.dnsServers[*]' 2>/dev/null | while IFS= read -r _g; do
+		[ "$(printf '%s' "$_g" | jsonfilter -e '@.enabled' 2>/dev/null)" = true ] || continue
+		[ -z "$(printf '%s' "$_g" | jsonfilter -e '@.domains[*]' 2>/dev/null)" ] && { echo yes; break; }
+	done | grep -q yes
+}
+dns_render() { # desired dnsmasq drop-in for the current state
+	[ "$(cfg_def main.use_dns 1)" = 1 ] || return 0
+	[ "$(nb_daemon_status)" = Connected ] || return 0
+	[ -f "$NBGL_RUN/dns_bad" ] && return 0
+	dns_listener_ok || return 0
+	_srv=$(echo "$NBGL_DNS_ADDR" | sed 's/:\([0-9]*\)$/#\1/')
+	{
+		dns_domains
+		# primary nameserver group: forward the extra domains too (default "local")
+		dns_has_primary && dns_extra
+	} | sort -u | while IFS= read -r _dom; do
+		# "*.dom" outranks GL's local=/local/ (rfc6761.conf) on dnsmasq >= 2.92
+		[ -n "$_dom" ] && printf 'server=/%s/%s\nserver=/*.%s/%s\nrebind-domain-ok=/%s/\n' \
+			"$_dom" "$_srv" "$_dom" "$_srv" "$_dom"
+	done
+}
+dns_extra() { # configured extra domains, one per line
+	for _dom in $(cfg_def main.dns_extra local | tr ',' ' '); do
+		_dom=$(echo "$_dom" | tr '[:upper:]' '[:lower:]' | sed 's/^\.*//; s/\.$//')
+		valid_domain "$_dom" && echo "$_dom"
+	done
+}
+valid_domain_list() { # "local, home.arpa" - up to 10 domains
+	[ ${#1} -le 300 ] || return 1
+	_n=0
+	for _dom in $(echo "$1" | tr ',' ' '); do
+		valid_domain "${_dom#.}" || return 1
+		_n=$((_n + 1))
+	done
+	[ $_n -le 10 ]
+}
+dns_sync() {
+	_want=$(dns_render)
+	_changed=0
+	_wrote=0
+	for _dir in $(dnsmasq_confdirs); do
+		_cf="$_dir/netbird-gl.conf"
+		if [ -n "$_want" ]; then
+			[ -d "$_dir" ] || continue
+			_wrote=1
+			if [ "$(cat "$_cf" 2>/dev/null)" != "$_want" ]; then
+				printf '%s\n' "$_want" >"$_cf" && chmod 644 "$_cf" && _changed=1
+			fi
+		elif [ -f "$_cf" ]; then
+			rm -f "$_cf" && _changed=1
+		fi
+	done
+	[ -n "$_want" ] && [ $_wrote = 0 ] && log "no dnsmasq conf-dir found - NetBird DNS cannot be forwarded"
+	printf '%s\n' "$_want" | sed -n 's|^server=/\([^*/][^/]*\)/.*|\1|p' >"$NBGL_RUN/dns_domains"
+	# a restart postponed by the guard below is done on a later run
+	[ -f "$NBGL_RUN/dns_pending" ] && _changed=1
+	if [ $_changed = 1 ]; then
+		# guard against a restart loop if something wipes the conf-dir
+		_lr=$(cat "$NBGL_RUN/dns_restart" 2>/dev/null || echo 0)
+		if [ $(($(now) - _lr)) -lt 60 ]; then
+			[ -f "$NBGL_RUN/dns_pending" ] || log "dnsmasq was restarted less than 60 s ago - applying the NetBird drop-in a bit later"
+			touch "$NBGL_RUN/dns_pending"
+			return 0
+		fi
+		rm -f "$NBGL_RUN/dns_pending"
+		now >"$NBGL_RUN/dns_restart"
+		log "DNS forwarding for NetBird domains updated: $(tr '\n' ' ' <"$NBGL_RUN/dns_domains")"
+		[ -x "$NBGL_DNSMASQ_INIT" ] && "$NBGL_DNSMASQ_INIT" restart >/dev/null 2>&1
+		# never leave the router without DNS: if dnsmasq rejects the drop-in,
+		# remove it and restart once more
+		sleep 2
+		if [ -n "$_want" ] && command -v pidof >/dev/null 2>&1 && ! pidof dnsmasq >/dev/null 2>&1; then
+			log "dnsmasq did not start with the NetBird drop-in - reverting"
+			touch "$NBGL_RUN/dns_bad"
+			for _dir in $(dnsmasq_confdirs); do rm -f "$_dir/netbird-gl.conf"; done
+			"$NBGL_DNSMASQ_INIT" restart >/dev/null 2>&1
+		fi
+	fi
+	return 0
+}
+
+# On GL /etc/resolv.conf links to dnsmasq's upstream list (resolv.conf.auto),
+# which NetBird would overwrite. Give NetBird its own file and repair the list.
+resolv_guard() {
+	[ "$(cfg_def main.protect_resolv 1)" = 1 ] || return 0
+	_own=$NBGL_RESOLV_OWN
+	if [ ! -s "$_own" ]; then
+		_dom=$(uci -q get dhcp.@dnsmasq[0].domain)
+		{ [ -n "$_dom" ] && echo "search $_dom"; echo "nameserver 127.0.0.1"; } >"$_own"
+	fi
+	if [ "$(readlink "$NBGL_ETC_RESOLV" 2>/dev/null)" != "$_own" ]; then
+		ln -sf "$_own" "$NBGL_ETC_RESOLV" && log "/etc/resolv.conf now points to $_own (protects GL's DNS upstream list)"
+	fi
+	grep -q 'Generated by NetBird' "$NBGL_RESOLV_AUTO" 2>/dev/null || return 0
+	_tmp="$NBGL_RUN/resolv.auto.$$"
+	for _if in $(ubus list 'network.interface.*' 2>/dev/null); do
+		_s=$(ubus call "$_if" status 2>/dev/null) || continue
+		[ "$(printf '%s' "$_s" | jsonfilter -e '@.up' 2>/dev/null)" = true ] || continue
+		_ns=$(printf '%s' "$_s" | jsonfilter -e '@["dns-server"][*]' 2>/dev/null)
+		[ -n "$_ns" ] || continue
+		echo "# Interface ${_if#network.interface.}"
+		for _n in $_ns; do echo "nameserver $_n"; done
+	done >"$_tmp"
+	if [ -s "$_tmp" ]; then
+		cat "$_tmp" >"$NBGL_RESOLV_AUTO"
+		log "repaired $NBGL_RESOLV_AUTO overwritten by NetBird: $(grep -c nameserver "$_tmp") server(s)"
+	else
+		: >"$NBGL_RESOLV_AUTO"
+		log "removed NetBird content from $NBGL_RESOLV_AUTO (no interface DNS servers known yet)"
+	fi
+	rm -f "$_tmp"
+}
+resolv_unguard() { # used by the uninstaller
+	[ "$(readlink "$NBGL_ETC_RESOLV" 2>/dev/null)" = "$NBGL_RESOLV_OWN" ] && ln -sf /tmp/resolv.conf "$NBGL_ETC_RESOLV"
+	rm -f "$NBGL_RESOLV_OWN"
+}
+# Remove everything netbird-gl put into dnsmasq and restart it
+dns_reset() {
+	for _dir in $(dnsmasq_confdirs) /tmp/dnsmasq.d; do rm -f "$_dir/netbird-gl.conf"; done
+	rm -f "$NBGL_RUN/dns_bad" "$NBGL_RUN/dns_restart" "$NBGL_RUN/dns_domains"
+	[ -x "$NBGL_DNSMASQ_INIT" ] && "$NBGL_DNSMASQ_INIT" restart >/dev/null 2>&1
+	log "dnsmasq drop-in removed (dns-reset)"
+	echo "netbird-gl DNS forwarding removed, dnsmasq restarted"
+}
+
+# Human-readable DNS diagnosis.  $1 optional name to resolve (e.g. truenas.local)
+dns_check() {
+	echo "== settings"
+	echo "use_dns=$(cfg_def main.use_dns 1)  daemon=$(nb_daemon_status)  resolver=$NBGL_DNS_ADDR"
+	echo "== NetBird resolver listener"
+	if command -v netstat >/dev/null 2>&1; then
+		netstat -lnu 2>/dev/null | grep -E ':53 |:5053 ' || echo "(no udp listener on :53/:5053)"
+	fi
+	dns_listener_ok && echo "OK: listening on $NBGL_DNS_ADDR" || echo "PROBLEM: nothing listens on $NBGL_DNS_ADDR"
+	echo "== NetBird nameserver groups (status --json)"
+	nb_status_json | jsonfilter -e '@.dnsServers' 2>/dev/null || echo "(none)"
+	echo "== domains forwarded by netbird-gl"
+	cat "$NBGL_RUN/dns_domains" 2>/dev/null
+	echo "== dnsmasq conf-dirs and drop-in"
+	for _dir in $(dnsmasq_confdirs); do
+		echo "-- $_dir"
+		cat "$_dir/netbird-gl.conf" 2>/dev/null || echo "(no netbird-gl.conf)"
+	done
+	echo "== dnsmasq instances"
+	# shellcheck disable=SC2009
+	ps w | grep '[d]nsmasq'
+	grep -h -E '^(conf-dir|server|no-resolv|resolv-file|all-servers|strict-order)' /var/etc/dnsmasq.conf* 2>/dev/null
+	echo "== what dnsmasq loaded at its last start"
+	logread 2>/dev/null | grep -E 'dnsmasq\[[0-9]+\]: (started|using nameserver|using only locally-known addresses for local *$)' | tail -n 8
+	echo "== routes to nameservers"
+	for _ns in $(nb_status_json | jsonfilter -e '@.dnsServers[*].servers[*]' 2>/dev/null | sed 's/:[0-9]*$//' | sort -u); do
+		ip route get "$_ns" 2>/dev/null | head -n1
+	done
+	echo "== /etc/resolv.conf ($(ls -l /etc/resolv.conf 2>/dev/null | sed 's/.* \/etc/\/etc/'))"
+	cat /etc/resolv.conf 2>/dev/null
+	ls /etc/resolv.conf.original.netbird >/dev/null 2>&1 && echo "NOTE: NetBird backup /etc/resolv.conf.original.netbird exists"
+	grep -h '^resolv-file=' /var/etc/dnsmasq.conf* 2>/dev/null | cut -d= -f2 | sort -u | while IFS= read -r _rf; do
+		echo "== upstream servers from $_rf"
+		cat "$_rf" 2>/dev/null || echo "(missing)"
+	done
+	_lip=$(lan_ip)
+	echo "== public lookup through dnsmasq ($_lip - what LAN clients use)"
+	nslookup openwrt.org "$_lip" 2>&1 | tail -n +3 | head -n 4
+	if [ -n "${1:-}" ]; then
+		echo "== lookup of $1 through dnsmasq ($_lip)"
+		nslookup "$1" "$_lip" 2>&1 | tail -n +3
+	fi
+}
+
+# ============================================================ status JSON =
+status_json() {
+	_nbj=$(nb_status_json)
+	if [ -n "$_nbj" ] && printf '%s' "$_nbj" | jsonfilter -e '@.daemonStatus' >/dev/null 2>&1; then
+		:
+	else
+		_nbj=null
+	fi
+	_ver=$(nb_version)
+	# "enrolled" is sticky: once this router has been set up, a server outage
+	# (NeedsLogin / LoginFailed) shows the dashboard, never the setup wizard.
+	if [ "$(cfg_get state.enrolled)" != 1 ] && [ "$_nbj" != null ]; then
+		case "$(printf '%s' "$_nbj" | jsonfilter -e '@.daemonStatus' 2>/dev/null)" in
+			Connected | Connecting | Idle) cfg_set state.enrolled 1; cfg_commit ;;
+		esac
+	fi
+	printf '{"ok":true,"app":%s,"auth":%s,"enrolled":%s,' "$(json_str "$NBGL_VERSION")" \
+		"$(json_str "$(cfg_def main.auth gl)")" "$(json_bool "$(cfg_get state.enrolled)")"
+	printf '"binary":{"present":%s,"version":%s,"arch":%s},' \
+		"$(json_bool "$(nb_present && echo 1)")" "$(json_str "$_ver")" "$(json_str "$(arch_name 2>/dev/null)")"
+	printf '"daemon":%s,"nb":%s,' "$(json_str "$(nb_running && echo running || echo stopped)")" "$_nbj"
+	printf '"state":{"vpn":%s,"exit":%s},' "$(json_bool "$(state_vpn)")" "$(json_bool "$(state_exit)")"
+	printf '"switch":{"func":%s},' "$(json_str "$(switch_func)")"
+	printf '"dns":{"domains":['
+	_first=1
+	while IFS= read -r _dom; do
+		[ -n "$_dom" ] || continue
+		[ $_first = 1 ] || printf ','
+		_first=0
+		printf '%s' "$(json_str "$_dom")"
+	done <"$NBGL_RUN/dns_domains" 2>/dev/null
+	printf ']},"guard":{"kill":%s,"blocking":%s},' "$(if ks_active; then echo true; else echo false; fi)" \
+		"$(if ks_blocking; then echo true; else echo false; fi)"
+	printf '"settings":{"management_url":%s,"switch_invert":%s,"exit_node":%s,' \
+		"$(json_str "$(cfg_def main.management_url https://api.netbird.io:443)")" \
+		"$(json_bool "$(cfg_def main.switch_invert 0)")" "$(json_str "$(cfg_get main.exit_node)")"
+	printf '"dns_extra":%s,"kill_switch":%s,' "$(json_str "$(cfg_def main.dns_extra local)")" \
+		"$(json_bool "$(cfg_def main.kill_switch 0)")"
+	printf '"accept_routes":%s,"use_dns":%s,"allow_inbound":%s,"guest_access":%s,' \
+		"$(json_bool "$(cfg_def main.accept_routes 1)")" "$(json_bool "$(cfg_def main.use_dns 1)")" \
+		"$(json_bool "$(cfg_def main.allow_inbound 0)")" "$(json_bool "$(cfg_def main.guest_access 0)")"
+	printf '"auto_check":%s,"auto_update":%s,"update_delay_days":%s},' \
+		"$(json_bool "$(cfg_def main.auto_check 1)")" "$(json_bool "$(cfg_def main.auto_update 1)")" \
+		"$(json_num "$(cfg_def main.update_delay_days 7)")"
+	printf '"networks":['
+	_first=1
+	nb_networks | while IFS='	' read -r _id _net _sel; do
+		[ -n "$_id" ] || continue
+		[ $_first = 1 ] || printf ','
+		_first=0
+		printf '{"id":%s,"network":%s,"selected":%s,"exit":%s}' "$(json_str "$_id")" "$(json_str "$_net")" \
+			"$(json_bool "$_sel")" "$(json_bool "$(is_exit_net "$_net" && echo 1)")"
+	done
+	printf '],'
+	_lat=$(cfg_get update.latest)
+	_avail=0
+	[ -n "$_lat" ] && { [ -z "$_ver" ] || version_gt "$_lat" "$_ver"; } && _avail=1
+	printf '"update":{"latest":%s,"available":%s,"first_seen":%s,"auto_at":%s,"last_check":%s,"installed_at":%s,"job":%s,"error":%s},' \
+		"$(json_str "$_lat")" "$(json_bool "$_avail")" "$(json_num "$(cfg_get update.first_seen)")" \
+		"$(json_num "$(upd_auto_at)")" "$(json_num "$(cat "$NBGL_RUN/last_check" 2>/dev/null)")" \
+		"$(json_num "$(cfg_get update.installed_at)")" \
+		"$(json_str "$(cat "$NBGL_RUN/job" 2>/dev/null || echo idle)")" \
+		"$(json_str "$(cat "$NBGL_RUN/upd_error" 2>/dev/null)")"
+	printf '"last_up":%s,' "$(json_str "$(tail -n 3 "$NBGL_RUN/last_up.log" 2>/dev/null)")"
+	printf '"log":%s}\n' "$(json_str "$(tail -n 60 "$NB_LOG" 2>/dev/null)")"
+}
+
+# ============================================================ settings ====
+# key=value pairs; returns 2 on an invalid value ($BAD_FIELD)
+settings_apply() {
+	_reup=0
+	_fw=0
+	for _kv in "$@"; do
+		_k=${_kv%%=*}
+		_v=${_kv#*=}
+		case "$_k" in
+			switch_invert | auto_check | auto_update | kill_switch) valid_bool "$_v" || { BAD_FIELD=$_k; return 2; } ;;
+			dns_extra) [ -z "$_v" ] || valid_domain_list "$_v" || { BAD_FIELD=$_k; return 2; } ;;
+			accept_routes | use_dns)
+				valid_bool "$_v" || { BAD_FIELD=$_k; return 2; }
+				[ "$(cfg_get "main.$_k")" != "$_v" ] && _reup=1
+				;;
+			allow_inbound | guest_access)
+				valid_bool "$_v" || { BAD_FIELD=$_k; return 2; }
+				[ "$(cfg_get "main.$_k")" != "$_v" ] && { _reup=1; _fw=1; }
+				;;
+			update_delay_days) valid_int "$_v" 0 90 || { BAD_FIELD=$_k; return 2; } ;;
+			switch_func)
+				case "$_v" in none | NetBird-VPN | NetBird-Exit-Node) ;; *) BAD_FIELD=$_k; return 2 ;; esac
+				;;
+			exit_node) [ -z "$_v" ] || valid_netid "$_v" || { BAD_FIELD=$_k; return 2; } ;;
+			exit_node_idx) valid_int "$_v" 0 999 || { BAD_FIELD=$_k; return 2; } ;;
+			*) BAD_FIELD=$_k; return 2 ;;
+		esac
+	done
+	for _kv in "$@"; do
+		case "${_kv%%=*}" in
+			switch_func) switch_set_func "${_kv#*=}" ;;
+			exit_node_idx)
+				# index into the current network list - works for any (UTF-8) name
+				_line=$(nb_networks | sed -n "$((${_kv#*=} + 1))p")
+				_nid=$(printf '%s' "$_line" | cut -f1)
+				_nnet=$(printf '%s' "$_line" | cut -f2)
+				if [ -z "$_nid" ] || ! is_exit_net "$_nnet"; then BAD_FIELD=exit_node; return 2; fi
+				cfg_set main.exit_node "$_nid"
+				;;
+			*) cfg_set "main.${_kv%%=*}" "${_kv#*=}" ;;
+		esac
+	done
+	[ -z "$(cfg_get main.exit_node)" ] && cfg_set state.exit 0
+	cfg_commit
+	guard_sync
+	[ $_fw = 1 ] && fw_setup
+	if [ $_reup = 1 ] && [ "$(nb_daemon_status)" = Connected ]; then
+		nb_down
+	fi
+	reconcile force
+	return 0
+}
+
+# ============================================================ enrollment ==
+# $1 management url, $2 file holding the setup key
+enroll() {
+	valid_url "$1" || return 2
+	[ -s "$2" ] || return 2
+	valid_setup_key "$(cat "$2")" || return 2
+	nb_present || return 5
+	nb_running || { "$NB_INIT" start >/dev/null 2>&1; sleep 3; }
+	cfg_set main.management_url "$1"
+	cfg_set state.vpn 1
+	cfg_commit
+	nb_down
+	nb_up "$2"
+	_rc=$?
+	rm -f "$2"
+	[ $_rc -eq 0 ] || return 6
+	cfg_set state.enrolled 1
+	cfg_commit
+	return 0
+}
+
+# ============================================================ password ====
+pw_hash() { # $1 salt, $2 password -> hex (iterated sha256)
+	_h=$(printf '%s:%s' "$1" "$2" | sha256sum | cut -d' ' -f1)
+	_i=0
+	while [ $_i -lt 500 ]; do
+		_h=$(printf '%s%s' "$_h" "$1" | sha256sum | cut -d' ' -f1)
+		_i=$((_i + 1))
+	done
+	echo "$_h"
+}
+# $1 bytes (max 32) -> hex.  GL's BusyBox has no od/hexdump, so hash urandom.
+rand_hex() { head -c 32 /dev/urandom | sha256sum | cut -c1-$((${1:-16} * 2)); }
+set_password() {
+	if [ -t 0 ]; then
+		stty -echo 2>/dev/null
+		printf 'New password (min. 10 characters): ' >&2; read -r _p1; echo >&2
+		printf 'Repeat: ' >&2; read -r _p2; echo >&2
+		stty echo 2>/dev/null
+	else
+		read -r _p1; _p2=$_p1
+	fi
+	[ "$_p1" = "$_p2" ] || { echo "Passwords do not match" >&2; return 1; }
+	[ ${#_p1} -ge 10 ] || { echo "Password too short" >&2; return 1; }
+	_s=$(rand_hex 16)
+	cfg_set main.pw_salt "$_s"
+	cfg_set main.pw_hash "$(pw_hash "$_s" "$_p1")"
+	cfg_commit
+	rm -rf "$NBGL_RUN/sessions"
+	echo "Password set." >&2
+}
+
+# ============================================================ agent =======
+agent() {
+	trap 'exit 0' TERM INT
+	log "agent started (netbird-gl $NBGL_VERSION)"
+	_tick=0
+	while :; do
+		if ! nb_present; then
+			if [ $((_tick % 15)) -eq 0 ]; then
+				log "NetBird binary missing - downloading the latest release"
+				upd_install latest >/dev/null 2>&1 || log "NetBird download failed - will retry"
+			fi
+		else
+			reconcile
+			if [ $((_tick % 15)) -eq 14 ]; then
+				if [ "$(nb_daemon_status)" = Connected ] && ! nb_chains_present; then
+					log "NetBird firewall rules missing after a firewall reload - restarting daemon"
+					"$NB_INIT" restart >/dev/null 2>&1
+				fi
+				_sz=$(wc -c <"$NB_LOG" 2>/dev/null || echo 0)
+				[ "${_sz:-0}" -gt 1048576 ] && tail -n 500 "$NB_LOG" >"$NB_LOG.tmp" && mv -f "$NB_LOG.tmp" "$NB_LOG"
+			fi
+			# first check ~10 min after start, then hourly (limited to once per 24 h)
+			[ $((_tick % 180)) -eq 30 ] && upd_cycle
+		fi
+		_tick=$((_tick + 1))
+		sleep 20 &
+		wait $!
+	done
+}
+
+# Checks that this router's BusyBox handles everything netbird-gl relies on.
+selftest() {
+	_f=0
+	t() { if "$@"; then :; else echo "selftest FAILED: $*" >&2; _f=1; fi; }
+	tn() { if "$@"; then echo "selftest FAILED (accepted): $*" >&2; _f=1; fi; }
+	t valid_url "https://api.netbird.io:443"
+	t valid_url "https://netbird.example.com"
+	t valid_url "https://netbird.vpn.example.co.uk:33073/path"
+	tn valid_url "http://api.netbird.io"
+	tn valid_url "https://x.y;reboot"
+	tn valid_url "https://x.y:99999"
+	t valid_setup_key "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+	tn valid_setup_key "AAAAAAAA;id"
+	t valid_netid "Home exit-1"
+	tn valid_netid "-x"
+	t valid_version "0.83.2"
+	t valid_int 7 1 90
+	tn valid_int 0 1 90
+	t valid_netid "Exit Node (Homelab)"
+	t valid_domain "netbird.selfhosted"
+	tn valid_domain "a/b"
+	_d=$(urldec 'https%3A%2F%2Fnetbird.example.com%3A443')
+	[ "$_d" = "https://netbird.example.com:443" ] || { echo "selftest FAILED: urldec -> '$_d'" >&2; _f=1; }
+	_r=$(rand_hex 16)
+	[ ${#_r} -eq 32 ] || { echo "selftest FAILED: rand_hex" >&2; _f=1; }
+	_j=$(json_str "a\"b")
+	[ "$_j" = '"a\"b"' ] || { echo "selftest FAILED: json_str -> $_j" >&2; _f=1; }
+	return $_f
+}
+
+usage() {
+	cat <<-'EOF'
+	netbird-gl - NetBird for GL.iNet routers
+	  status                    state as JSON
+	  up | down                 connect / disconnect (remembered)
+	  exit on|off               exit node (selected in settings)
+	  switch vpn|exit on|off    toggle switch action
+	  set key=value ...         change settings
+	  enroll URL                enroll; setup key read from stdin
+	  update-check              check for the latest NetBird release
+	  update [version|latest]   install/update NetBird
+	  auth-selftest             verify GL session authentication
+	  dns-check [name]          explain NetBird DNS forwarding, optionally resolve a name
+	  dns-reset                 remove the dnsmasq drop-in and restart dnsmasq
+	  resolv-guard              keep NetBird away from GL's DNS upstream list
+	  fw-setup | fw-remove      netbird firewall zone
+	  set-password              password for auth=password
+	  agent                     supervisor loop (started by procd)
+	EOF
+}
+
+[ "${NBGL_NO_MAIN:-0}" = 1 ] && return 0 2>/dev/null
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case "$cmd" in
+	status) status_json ;;
+	up) set_vpn 1 ;;
+	down) set_vpn 0 ;;
+	exit)
+		case "${1:-}" in on) set_exit 1 ;; off) set_exit 0 ;; *) usage; exit 1 ;; esac ;;
+	switch) switch_action "${1:-}" "${2:-}" ;;
+	set) settings_apply "$@" || { echo "invalid field: $BAD_FIELD" >&2; exit 2; } ;;
+	enroll)
+		_kf=$(mktemp "$NBGL_RUN/sk.XXXXXX") || exit 1
+		head -n1 | tr -d '\r\n ' >"$_kf"
+		enroll "${1:-}" "$_kf"; _r=$?; rm -f "$_kf"; exit $_r ;;
+	update-check) upd_check force && cfg_get update.latest ;;
+	update) upd_install "${1:-latest}" ;;
+	update-cycle) upd_cycle "${1:-}" ;;
+	auth-selftest) rm -f "$NBGL_RUN/rpc_selftest"; rpc_trustworthy ;;
+	selftest) selftest ;;
+	dns-check) dns_check "${1:-}" ;;
+	dns-reset) dns_reset ;;
+	resolv-guard) resolv_guard ;;
+	resolv-unguard) resolv_unguard ;;
+	fw-setup) fw_setup ;;
+	fw-remove) fw_remove ;;
+	fw-reload)
+		# called by fw3 after a firewall reload - check in the background
+		( sleep 5; if [ "$(nb_daemon_status)" = Connected ] && ! nb_chains_present; then "$NB_INIT" restart; fi; guard_sync ) >/dev/null 2>&1 &
+		;;
+	reconcile) reconcile force ;;
+	guard-off) killswitch_off ;;
+	lan-ip) lan_ip ;;
+	set-password) set_password ;;
+	agent) agent ;;
+	*) usage; [ -z "$cmd" ] || [ "$cmd" = help ] || exit 1 ;;
+esac

@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "crontab $*" >> "${FIX_DIR:-/tmp}/cmds.log"
+exit 0

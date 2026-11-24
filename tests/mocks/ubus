@@ -1,0 +1,11 @@
+#!/bin/sh
+# mock ubus: two interfaces, wan up with DNS 192.168.1.1, lan without DNS
+case "$1" in
+	list) printf 'network.interface.lan\nnetwork.interface.wan\n' ;;
+	call)
+		case "$2" in
+			network.interface.wan) echo '{"up":true,"dns-server":["192.168.1.1","192.168.1.2"]}' ;;
+			network.interface.lan) echo '{"up":true,"dns-server":[]}' ;;
+			*) exit 4 ;;
+		esac ;;
+esac

@@ -1,0 +1,7 @@
+#!/bin/sh
+# mock netstat: NetBird resolver listens on 127.0.0.1:5053 unless $FIX_DIR/no_listener exists
+echo "Active Internet connections (only servers)"
+echo "Proto Recv-Q Send-Q Local Address           Foreign Address         State"
+echo "udp        0      0 0.0.0.0:53              0.0.0.0:*"
+[ -f "${FIX_DIR:-/tmp}/no_listener" ] || echo "udp        0      0 127.0.0.1:5053          0.0.0.0:*"
+exit 0

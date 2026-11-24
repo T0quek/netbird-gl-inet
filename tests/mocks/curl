@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""Mock curl: GL /rpc sessions, GitHub API and downloads served from $FIX_DIR"""
+import os, sys, json
+a = sys.argv[1:]; out = None; data = None; url = a[-1]; wfmt = None
+i = 0
+while i < len(a):
+    if a[i] == "-o": out = a[i+1]; i += 2; continue
+    if a[i] in ("--data", "--data-binary"): data = a[i+1]; i += 2; continue
+    if a[i] == "-w": wfmt = a[i+1]; i += 2; continue
+    i += 1
+log = os.path.join(os.environ.get("FIX_DIR", "/tmp"), "curl.log")
+open(log, "a").write(" ".join(a) + "\n")
+def emit(b):
+    if out and out != "/dev/null": open(out, "wb").write(b)
+    elif not out: sys.stdout.buffer.write(b)
+if url.endswith("/rpc"):
+    req = json.loads(data); sid = req["params"][0]
+    if sid == "validsid0123456789abcdef" or os.path.exists(os.path.join(os.environ.get("FIX_DIR", "/tmp"), "rpc_open")):
+        emit(b'{"id":1,"jsonrpc":"2.0","result":{"ok":1}}')
+    else:
+        emit(b'{"id":1,"jsonrpc":"2.0","error":{"code":-32000,"message":"Access denied"}}')
+    sys.exit(0)
+fx = os.environ.get("FIX_DIR")
+if "api.github.com" in url:
+    if os.path.exists(os.path.join(fx, "offline")): sys.exit(6)
+    emit(json.dumps({"tag_name": "v" + open(os.path.join(fx, "latest")).read().strip()}).encode()); sys.exit(0)
+if "/releases/download/" in url:
+    f = os.path.join(fx, url.rsplit("/", 1)[1])
+    if not os.path.exists(f): sys.exit(22)
+    emit(open(f, "rb").read()); sys.exit(0)
+sys.exit(7)

@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "$1" >> "${FIX_DIR:-/tmp}/dnsmasq.log"
+exit 0

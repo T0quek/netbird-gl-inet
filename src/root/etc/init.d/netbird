@@ -1,0 +1,32 @@
+#!/bin/sh /etc/rc.common
+# NetBird daemon supervised by procd (netbird-gl).
+# shellcheck disable=SC2034
+START=95
+STOP=10
+USE_PROCD=1
+NB_BIN=/usr/bin/netbird
+
+start_service() {
+	if [ ! -x "$NB_BIN" ]; then
+		logger -t netbird "$NB_BIN missing - the netbird-gl agent will download it"
+		return 0
+	fi
+	# keep NetBird from rewriting GL's DNS upstream list (resolv.conf.auto)
+	[ -x /usr/sbin/netbird-gl ] && /usr/sbin/netbird-gl resolv-guard >/dev/null 2>&1
+	mkdir -p /etc/netbird /var/log/netbird /var/lib
+	chmod 700 /etc/netbird
+	# /var is tmpfs: keep state and keys in /etc/netbird (overlay)
+	if [ ! -L /var/lib/netbird ]; then
+		[ -d /var/lib/netbird ] && cp -a /var/lib/netbird/. /etc/netbird/ 2>/dev/null
+		rm -rf /var/lib/netbird
+		ln -s /etc/netbird /var/lib/netbird
+	fi
+	procd_open_instance netbird
+	procd_set_param command "$NB_BIN" service run --log-level info \
+		--log-file /var/log/netbird/client.log
+	procd_set_param env NB_DISABLE_SSH_CONFIG=1
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 0
+	procd_set_param stderr 0
+	procd_close_instance
+}

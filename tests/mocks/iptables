@@ -1,0 +1,11 @@
+#!/bin/sh
+# mock iptables/ip6tables: tracks only the FORWARD -> NBGL_KILL jump
+f="${FIX_DIR:-/tmp}/$(basename "$0").kill"
+echo "$*" >> "${FIX_DIR:-/tmp}/$(basename "$0").log"
+args=" $* "
+case "$args" in
+	*" -C FORWARD -j NBGL_KILL "*) [ -f "$f" ] ;;
+	*" -I FORWARD 1 -j NBGL_KILL "*) touch "$f" ;;
+	*" -D FORWARD -j NBGL_KILL "*) [ -f "$f" ] && rm -f "$f" ;;
+	*) exit 0 ;;
+esac
